@@ -1,0 +1,40 @@
+// Shared build settings for the Oh My Pi macOS app.
+// Personal overrides (signing team) go in Config/Local.xcconfig, which is git-ignored.
+
+PRODUCT_NAME = OhMyPi
+PRODUCT_BUNDLE_IDENTIFIER = sh.omp.desktop
+MARKETING_VERSION = 0.2.0
+CURRENT_PROJECT_VERSION = 2
+
+MACOSX_DEPLOYMENT_TARGET = 15.0
+SUPPORTED_PLATFORMS = macosx
+SDKROOT = macosx
+
+SWIFT_VERSION = 5.0
+SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor
+SWIFT_APPROACHABLE_CONCURRENCY = YES
+SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES
+SWIFT_EMIT_LOC_STRINGS = YES
+
+// The app spawns `omp` and lets it edit arbitrary project folders, which the sandbox forbids.
+ENABLE_APP_SANDBOX = NO
+ENABLE_HARDENED_RUNTIME = YES
+
+GENERATE_INFOPLIST_FILE = YES
+INFOPLIST_KEY_CFBundleDisplayName = Oh My Pi
+INFOPLIST_KEY_LSApplicationCategoryType = public.app-category.developer-tools
+INFOPLIST_KEY_NSHumanReadableCopyright = Copyright © 2026 Oh My Pi contributors. MIT License.
+INFOPLIST_KEY_NSPrincipalClass = NSApplication
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor
+ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES
+LOCALIZATION_PREFERS_STRING_CATALOGS = YES
+STRING_CATALOG_GENERATE_SYMBOLS = YES
+
+// Signing: automatic when a team is set in Local.xcconfig; otherwise ad-hoc so anyone can build and run.
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM =
+CODE_SIGN_IDENTITY = -
+LD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks
+
+#include? "Local.xcconfig"

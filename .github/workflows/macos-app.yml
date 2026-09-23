@@ -1,0 +1,62 @@
+name: macOS app
+
+on:
+   push:
+      branches: [main]
+      paths:
+         - "OhMyPi/**"
+         - ".github/workflows/macos-app.yml"
+      tags:
+         - "macos-app-v*"
+   pull_request:
+      paths:
+         - "OhMyPi/**"
+         - ".github/workflows/macos-app.yml"
+
+permissions:
+   contents: write
+
+jobs:
+   build:
+      name: Build
+      runs-on: macos-26
+      defaults:
+         run:
+            working-directory: OhMyPi
+      steps:
+         - uses: actions/checkout@v4
+
+         - name: Select Xcode
+           run: sudo xcode-select -s /Applications/Xcode_26.0.app || sudo xcode-select -s "$(ls -d /Applications/Xcode_26* | tail -1)"
+
+         - name: Resolve packages
+           run: xcodebuild -resolvePackageDependencies -project OhMyPi.xcodeproj -scheme OhMyPi
+
+         - name: Build (Debug, unsigned)
+           run: |
+              xcodebuild \
+                 -project OhMyPi.xcodeproj \
+                 -scheme OhMyPi \
+                 -configuration Debug \
+                 -destination 'platform=macOS' \
+                 -derivedDataPath build \
+                 CODE_SIGNING_ALLOWED=NO \
+                 build
+
+         - name: Package DMG
+           if: startsWith(github.ref, 'refs/tags/macos-app-v')
+           run: scripts/release.sh
+
+         - name: Upload DMG
+           if: startsWith(github.ref, 'refs/tags/macos-app-v')
+           uses: actions/upload-artifact@v4
+           with:
+              name: OhMyPi-dmg
+              path: OhMyPi/build/*.dmg
+
+         - name: Attach to release
+           if: startsWith(github.ref, 'refs/tags/macos-app-v')
+           uses: softprops/action-gh-release@v2
+           with:
+              files: OhMyPi/build/*.dmg
+              generate_release_notes: true

@@ -1,0 +1,7 @@
+// Copy to Config/Local.xcconfig (git-ignored) to sign with your own Apple Developer team.
+// Leave it out to build with an ad-hoc signature that runs on your own machine.
+
+DEVELOPMENT_TEAM = ABCDE12345
+CODE_SIGN_IDENTITY = Apple Development
+// For notarized releases:
+// CODE_SIGN_IDENTITY = Developer ID Application
