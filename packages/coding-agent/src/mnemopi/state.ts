@@ -454,10 +454,10 @@ export class MnemopiSessionState {
 		return this.formatScopedRecallContext(results, format) ?? "";
 	}
 
+	/** Background write: a failed write is logged and returns `undefined` instead of throwing. */
 	rememberInScope(memory: MnemopiRememberInput, options: MnemopiRememberOptions = {}): string | undefined {
 		try {
-			const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
-			return this.scoped.retain.memory.remember(scrubbed, scrubbedOptions);
+			return this.rememberScoped(memory, options);
 		} catch (error) {
 			logger.warn("Mnemopi: retain failed", {
 				bank: this.scoped.retain.bank,
@@ -467,17 +467,23 @@ export class MnemopiSessionState {
 		}
 	}
 
-	rememberScoped(memory: MnemopiRememberInput, options: MnemopiRememberOptions = {}): string | undefined {
-		return this.rememberInScope(memory, options);
+	/** Explicit write: throws the storage error, so the caller can report why nothing was stored. */
+	rememberScoped(memory: MnemopiRememberInput, options: MnemopiRememberOptions = {}): string {
+		const [scrubbed, scrubbedOptions] = redactRememberWrite(memory, options);
+		return this.scoped.retain.memory.remember(scrubbed, scrubbedOptions);
 	}
 
-	async recallForContext(query: string): Promise<string | undefined> {
+	async recallForContext(query: string, signal?: AbortSignal): Promise<string | undefined> {
 		const results = await this.collectScopedRecallResults(query);
+		if (signal?.aborted) return undefined;
 		if (results.length === 0) return undefined;
 		return formatRecallBlock(results);
 	}
 
-	async beforeAgentStartPrompt(promptText: string): Promise<MemoryPromptPreparation | undefined> {
+	async beforeAgentStartPrompt(
+		promptText: string,
+		signal?: AbortSignal,
+	): Promise<MemoryPromptPreparation | undefined> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
@@ -486,7 +492,7 @@ export class MnemopiSessionState {
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
-		const context = await this.recallForContext(truncated);
+		const context = await this.recallForContext(truncated, signal);
 		return {
 			context,
 			commit: () => {

@@ -12,7 +12,7 @@ import { isEnoent, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import { formatModelRoleAlias, roleCandidatePool } from "../../config/model-roles";
 import { resolveModelRoleValue } from "../../config/model-resolver";
 import { isSettingsInitialized, settings } from "../../config/settings";
-import { resolveLocalRoot } from "../../internal-urls";
+import { resolveLocalRoot, resolveLocalUrlToPath } from "../../internal-urls";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { extractImagePathFromText } from "@oh-my-pi/pi-tui/prompt/custom-editor";
@@ -39,7 +39,7 @@ import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
 import { pickRecentFocusableAgentId } from "./session-focus-controller";
 import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { parseSlashCommand } from "../../slash-commands/helpers/parse";
+import { parseSlashCommand, parseSubcommand } from "../../slash-commands/helpers/parse";
 import { getTinyLocalModelSpec, isTinyLocalModelKey } from "../../tiny/models";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
@@ -57,8 +57,10 @@ import { EnhancedPasteController } from "../../utils/enhanced-paste";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { loadImageInput } from "../../utils/image-loading";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "@oh-my-pi/pi-tui/chat/image-loading";
+import { type ImageAttachmentSource, tagImageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
+import { blobExtensionForImageMimeType } from "@oh-my-pi/pi-tui/prompt/image-format";
 import { VideoError, buildVideoContactSheetPng, probeVideo } from "../../utils/video";
-import { createVideoPreviewImage, isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
+import { isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
 import { resizeImage } from "../../utils/image-resize";
 
 /**
@@ -117,6 +119,22 @@ const SHELL_PROMPT_COMMAND_RE =
 	/^(?:\.{0,2}\/|~\/|cd(?:\s|$)|sudo(?:\s|$)|git(?:\s|$)|bun(?:\s|$)|npm(?:\s|$)|pnpm(?:\s|$)|yarn(?:\s|$)|node(?:\s|$)|python\d*(?:\s|$)|cargo(?:\s|$)|go(?:\s|$)|make(?:\s|$)|docker(?:\s|$)|kubectl(?:\s|$))/;
 const SHELL_PROMPT_OPERATOR_RE = /(?:^|\s)(?:&&|\|\||\||2>&1|[<>]{1,2})(?:\s|$)/;
 const OMP_STATUS_LINE_RE = /^\s*in:\s+\d+\s+out:\s+\d+(?:\s+cache\s+\S+)?\s+t:\s+\S+\s+tok\/s:\s+\S+/m;
+
+/**
+ * Read-only slash commands that also run from a focused subagent view, keyed by name to
+ * a check on their arguments; every other command (and mutating forms such as
+ * `/usage reset`, which spends a saved rate-limit reset) still needs the main session.
+ */
+const FOCUSED_VIEW_COMMANDS: Record<string, (args: string) => boolean> = {
+	export: () => true,
+	usage: args => {
+		const { verb, rest } = parseSubcommand(args);
+		return !verb || (verb === "show" && !rest);
+	},
+};
+const FOCUSED_VIEW_COMMAND_LIST = Object.keys(FOCUSED_VIEW_COMMANDS)
+	.map(name => `/${name}`)
+	.join(", ");
 
 function looksLikePastedShellPrompt(code: string): boolean {
 	const firstLine = code.split("\n", 1)[0]?.trimStart() ?? "";
@@ -390,6 +408,16 @@ export class InputController {
 					this.toggleToolActivityVisibility();
 					return { consume: true };
 				}
+				if (this.ctx.keybindings.matches(data, "app.display.reset")) {
+					if (this.ctx.ui.hasOverlay()) return undefined;
+					// The tree selector rebinds Alt+L for its `labeled-only` filter
+					// and mounts inline (no overlay), so its own binding stays
+					// authoritative here — same defer as the tools toggle above.
+					if (this.ctx.ui.getFocused() instanceof TreeSelectorComponent && matchesKey(data, "alt+l"))
+						return undefined;
+					this.ctx.resetDisplayAfterAppearanceRefresh();
+					return { consume: true };
+				}
 				return undefined;
 			});
 		}
@@ -493,12 +521,15 @@ export class InputController {
 			}
 
 			if (this.ctx.loopModeEnabled) {
+				// Esc suspends the loop even mid-iteration: abort the live turn,
+				// then drop the captured prompt so the 800ms auto-resubmit never
+				// fires. Loop stays enabled (paused) — the next manual prompt
+				// resumes with a new body.
 				if (this.ctx.session.isStreaming) {
 					this.#abortStreamingTurn();
-				} else {
-					this.ctx.pauseLoop();
-					this.ctx.cancelPendingSubmission();
 				}
+				this.ctx.pauseLoop();
+				this.ctx.cancelPendingSubmission();
 				return;
 			}
 			if (this.ctx.focusedAgentId) {
@@ -653,11 +684,8 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleLiveCommand());
 		}
 		// Hold the space bar to push-to-talk: the editor recognizes the auto-repeat burst, tracks
-		// the spam back out, and toggles STT on hold start / release. Gated on `stt.enabled` so a
-		// disabled STT leaves the space bar typing normally.
-		this.ctx.editor.sttHoldEnabled = () => settings.get("stt.enabled");
-		this.ctx.editor.onSpaceHoldStart = () => void this.ctx.handleSTTToggle();
-		this.ctx.editor.onSpaceHoldEnd = () => void this.ctx.handleSTTToggle();
+		// the spam back out, and starts STT on hold start / stops it on release.
+		this.ctx.editor.spaceHold.handler = this.ctx.dictationSpaceHold(this.ctx.editor);
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.handleCopyCurrentLine());
 		}
@@ -1291,8 +1319,22 @@ export class InputController {
 			}
 			return;
 		}
+		if (text?.startsWith("/")) {
+			const parsed = parseSlashCommand(text);
+			if (parsed && FOCUSED_VIEW_COMMANDS[parsed.name]?.(parsed.args)) {
+				// Viewer-scoped commands: /export writes the focused transcript (with its
+				// own subagents), /usage reports account-wide limits.
+				this.#recordSlashCommandUsage(text);
+				if ((await executeBuiltinSlashCommand(text, { ctx: this.ctx })) === true) {
+					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+					return;
+				}
+			}
+		}
 		if (text && (text.startsWith("/") || text.startsWith("!") || parsePythonCommandInput(text))) {
-			this.ctx.showStatus("Commands run in the main session — press ←← to return first");
+			this.ctx.showStatus(
+				`Only ${FOCUSED_VIEW_COMMAND_LIST} run here; other commands run in the main session — press ←← to return first`,
+			);
 			return; // editor text not cleared: Editor does not auto-clear on submit
 		}
 		this.ctx.editor.clearDraft(text);
@@ -1821,12 +1863,14 @@ export class InputController {
 		return entries.length;
 	}
 
-	async #insertPendingImage(imageData: ImageContent, videoPath?: string): Promise<void> {
-		const image: ImageContent = videoPath
-			? createVideoPreviewImage(imageData, videoPath)
+	async #insertPendingImage(imageData: ImageContent, source?: ImageAttachmentSource): Promise<void> {
+		const image: ImageContent = source
+			? tagImageAttachmentSource(imageData, source.path, source.kind)
 			: { type: "image", data: imageData.data, mimeType: imageData.mimeType };
+		// File-backed attachments link to their file (so the chip opens it); payloads
+		// without one (a failed clipboard persist) materialize a clickable blob copy.
 		const imageLink =
-			videoPath ??
+			source?.path ??
 			(
 				await materializeImageReferenceLinks([image], this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager))
 			)?.[0];
@@ -1836,7 +1880,7 @@ export class InputController {
 		const imageNum = this.ctx.editor.pendingImages.length;
 		const dims = await this.#imageDimensions(imageData);
 		setCachedImageDimensions(image, dims ?? null);
-		const kind = videoPath === undefined ? "image" : "video";
+		const kind = source?.kind ?? "image";
 		// The buffer holds the compact chip token; the atom table expands it to the bracketed
 		// marker (the wire/transcript format) on submit.
 		const expansion = dims
@@ -1879,11 +1923,47 @@ export class InputController {
 		return imageData;
 	}
 
-	async #normalizeAndInsertPastedImage(image: ImageContent, unsupportedMessage: string): Promise<boolean> {
+	async #normalizeAndInsertPastedImage(
+		image: ImageContent,
+		unsupportedMessage: string,
+		sourcePath?: string,
+	): Promise<boolean> {
 		const normalized = await this.#normalizePastedImage(image, unsupportedMessage);
 		if (!normalized) return false;
-		await this.#insertPendingImage(normalized);
+		// Every attachment gets a file so tools can read, copy, or upload it: file-pasted
+		// images keep their original path; clipboard bitmaps are committed to the session
+		// and referenced by a relocation-safe `local://` URL. The reference reaches the
+		// model via the hidden companion message (see AgentSession's attachment source notices).
+		const filePath = sourcePath ?? (await this.#persistPastedImage(image));
+		await this.#insertPendingImage(normalized, filePath ? { path: filePath, kind: "image" } : undefined);
 		return true;
+	}
+
+	/**
+	 * Commit clipboard image bytes to the session's `local://` root (inside the session
+	 * artifact directory), as pasted: full resolution, before model auto-resize. Named by
+	 * content hash so re-pasting the same screenshot reuses one file. Returns the
+	 * `local://` URL rather than an absolute path: `/move` relocates the artifact
+	 * directory, and the URL resolves against the session's current root. Returns
+	 * undefined when the write fails; the image still attaches, just without a reference.
+	 */
+	async #persistPastedImage(image: ImageContent): Promise<string | undefined> {
+		const bytes = Buffer.from(image.data, "base64");
+		const extension = blobExtensionForImageMimeType(image.mimeType) ?? "png";
+		const url = `local://pasted-image-${Bun.hash(bytes).toString(16)}.${extension}`;
+		try {
+			const filePath = resolveLocalUrlToPath(url, {
+				getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+				getSessionId: () => this.ctx.sessionManager.getSessionId(),
+			});
+			await Bun.write(filePath, bytes);
+			return url;
+		} catch (error) {
+			logger.warn("failed to persist pasted image", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
 	}
 
 	/**
@@ -1914,7 +1994,7 @@ export class InputController {
 				{ type: "image", data: sheet.png.data, mimeType: sheet.png.mimeType },
 				"Unsupported pasted video preview format",
 			);
-			if (preview) await this.#insertPendingImage(preview, absolutePath);
+			if (preview) await this.#insertPendingImage(preview, { path: absolutePath, kind: "video" });
 		} catch (error) {
 			if (error instanceof VideoError) {
 				this.ctx.editor.pasteText(pastedPath);
@@ -1965,6 +2045,7 @@ export class InputController {
 			await this.#normalizeAndInsertPastedImage(
 				{ type: "image", data: image.data, mimeType: image.mimeType },
 				`Unsupported pasted image format: ${image.mimeType}`,
+				image.resolvedPath,
 			);
 		} catch (error) {
 			if (error instanceof ImageInputTooLargeError) {

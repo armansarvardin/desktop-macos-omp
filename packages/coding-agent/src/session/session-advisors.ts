@@ -627,7 +627,7 @@ export class SessionAdvisors {
 		for (const [slug, providers] of providersBySlug) {
 			if ((costs.get(slug) ?? 0) <= 0) continue;
 			for (const provider of providers) {
-				if (auth.hasOAuth(provider)) {
+				if (auth.credentials.hasOAuth(provider)) {
 					slugs.add(slug);
 					break;
 				}
@@ -1595,7 +1595,7 @@ export class SessionAdvisors {
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
 		if (accountPolicyDenial) {
-			const switched = await this.#host.modelRegistry.authStorage.rotateSessionCredential(
+			const switched = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{ error: message, modelId: currentModel.id, signal },
@@ -1614,7 +1614,7 @@ export class SessionAdvisors {
 		let usagePriorBlockedUntilMs: number | undefined;
 		let usagePriorBlockedUntilTimed: boolean | undefined;
 		if (usageLimit) {
-			const outcome = await this.#host.modelRegistry.authStorage.markUsageLimitReached(
+			const outcome = await this.#host.modelRegistry.authStorage.limits.markReached(
 				currentModel.provider,
 				advisor.providerSessionId,
 				{
@@ -1706,6 +1706,7 @@ export class SessionAdvisors {
 					from: currentSelector,
 					to: selector.raw,
 					role,
+					reason: `Advisor request failed: ${message}`,
 				});
 				return true;
 			}
@@ -2120,11 +2121,16 @@ export class SessionAdvisors {
 	/**
 	 * Wait for active advisor reviews and their emitted card events before a
 	 * headless caller disposes the session. Returns `false` and logs work disposal
-	 * will abandon when the shared deadline expires or an advisor fails.
+	 * will abandon when the shared deadline expires or an advisor stops for good
+	 * (halt, quota pause). A failing advisor releases the drain at once unless
+	 * `waitThroughRecovery` is set: then its retry and fallback-chain recovery is
+	 * waited through instead of being abandoned mid-switch.
 	 */
-	async waitForAdvisorCatchup(timeoutMs: number): Promise<boolean> {
+	async waitForAdvisorCatchup(timeoutMs: number, options?: { waitThroughRecovery?: boolean }): Promise<boolean> {
 		const deadline = Date.now() + timeoutMs;
-		const results = await Promise.all(this.#advisors.map(advisor => advisor.runtime.waitForCatchup(timeoutMs, 1)));
+		const results = await Promise.all(
+			this.#advisors.map(advisor => advisor.runtime.waitForCatchup(timeoutMs, 1, undefined, options)),
+		);
 		const cardEventsCaughtUp = await this.#waitForPendingAdvisorCardEvents(Math.max(0, deadline - Date.now()));
 		const abandoned = this.#advisors.filter(
 			(advisor, index) => results[index] === false && advisor.runtime.backlog > 0,

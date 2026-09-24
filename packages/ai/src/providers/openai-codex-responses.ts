@@ -81,6 +81,7 @@ import {
 	sanitizeCodexCallId,
 	transformRequestBody,
 } from "./openai-codex/request-transformer";
+import { applyCodexAccessPrograms, dropRejectedCodexAccessPrograms } from "./openai-codex/access-programs";
 import { CodexApiError } from "./openai-codex/response-handler";
 import { getCodexAttestationHeader } from "./openai-codex-attestation";
 export { createOpenAICodexCompactionRequestContext } from "./openai-codex-compaction";
@@ -1407,6 +1408,7 @@ function createCodexRequestContext(
 	}
 
 	const accountId = getCodexAccountId(apiKey);
+	applyCodexAccessPrograms(transformedBody, model, accountId);
 	const baseUrl = model.baseUrl || CODEX_BASE_URL;
 	const url = resolveCodexResponsesUrl(baseUrl);
 
@@ -1635,7 +1637,12 @@ async function openInitialCodexEventStream(
 			}
 		}
 	}
-	return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
+	try {
+		return await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
+	} catch (error) {
+		if (!dropRejectedCodexAccessPrograms(transformedBody, model, requestContext.accountId, error)) throw error;
+		return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
+	}
 }
 
 function toCodexRequestBody(body: OpenAICodexCompactionBody): RequestBody {
@@ -1712,6 +1719,22 @@ async function* streamCodexCompactionEvents(
 				const fallback = await openCodexSseTransport(model, requestContext, requestSetup, options, state);
 				if (state) state.lastTransport = fallback.transport;
 				yield* drainCodexCompactionEvents(fallback.eventStream, requestContext);
+				completed = true;
+				return;
+			}
+			const failure = bufferedEvents.findLast(event => event.type === "error" || event.type === "response.failed");
+			if (
+				failure !== undefined &&
+				dropRejectedCodexAccessPrograms(
+					requestContext.transformedBody,
+					model,
+					requestContext.accountId,
+					createCodexProviderStreamError(failure),
+				)
+			) {
+				const replay = await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState);
+				if (websocketState) websocketState.lastTransport = replay.transport;
+				yield* drainCodexCompactionEvents(replay.eventStream, requestContext);
 				completed = true;
 				return;
 			}
@@ -2558,6 +2581,9 @@ class CodexStreamProcessor {
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
+		if (await this.#tryDropRejectedAccessPrograms(error)) {
+			return true;
+		}
 		if (await this.#tryRecoverWhitespaceToolCallLoop(error)) {
 			return true;
 		}
@@ -2712,6 +2738,39 @@ class CodexStreamProcessor {
 			signal: this.requestSetup.requestSignal,
 		});
 		await this.#reopenWebSocketStream(websocketState);
+		return true;
+	}
+
+	/**
+	 * Replay the request without `access_programs` after the backend rejected the
+	 * requested cyber program (see `openai-codex/access-programs.ts`). A
+	 * rejection arrives before any output, so the replay is always safe.
+	 */
+	async #tryDropRejectedAccessPrograms(error: unknown): Promise<boolean> {
+		if (
+			hasVisibleAssistantContent(this.output) ||
+			this.options?.signal?.aborted ||
+			!dropRejectedCodexAccessPrograms(
+				this.requestContext.transformedBody,
+				this.model,
+				this.requestContext.accountId,
+				error,
+			)
+		) {
+			return false;
+		}
+		this.#closeOpenBlocksForReplay();
+		const websocketState = this.requestContext.websocketState;
+		if (websocketState) resetCodexWebSocketAppendState(websocketState);
+		this.runtime.resetAccumulators();
+		this.runtime.sawTerminalEvent = false;
+		resetOutputState(this.output);
+		this.firstTokenTime = undefined;
+		if (this.runtime.transport === "websocket" && websocketState) {
+			await this.#reopenWebSocketStream(websocketState);
+		} else {
+			await this.#reopenSseStream(websocketState);
+		}
 		return true;
 	}
 
@@ -4290,11 +4349,22 @@ async function openCodexSseEventStream(
 	// an internal timeout stays retryable while an explicit abort fails fast.
 	let clearPreResponseTimeout: (() => void) | undefined;
 	const fetchAttempt: FetchImpl = async (input, init) => {
+		let response: Response | undefined;
 		try {
-			return await (fetchOverride ?? fetch)(input, init);
+			response = await (fetchOverride ?? fetch)(input, init);
+			return response;
 		} finally {
-			clearPreResponseTimeout?.();
-			clearPreResponseTimeout = undefined;
+			// A successful streaming body is governed by the iterator-level idle
+			// watchdog, so disarm the pre-response guard the instant headers arrive.
+			// Keep it armed for a non-2xx response: the error body is still
+			// consumed under this deadline — by fetchWithRetry's
+			// retry-status inspection and by CodexApiError.fromResponse — otherwise a
+			// server that sends headers then stalls the body hangs the turn past every
+			// configured first-event/idle deadline (issue #12664).
+			if (!response || response.ok) {
+				clearPreResponseTimeout?.();
+				clearPreResponseTimeout = undefined;
+			}
 		}
 	};
 	const bodyJson = JSON.stringify(body);
@@ -4318,6 +4388,9 @@ async function openCodexSseEventStream(
 			body: requestBody,
 			signal,
 			prepareInit: () => {
+				// A retried non-2xx attempt leaves its guard armed for the retry-status
+				// body read; disarm it before arming the next attempt's guard.
+				clearPreResponseTimeout?.();
 				const watchdog = armPreResponseTimeout(signal, firstEventTimeoutMs);
 				clearPreResponseTimeout = watchdog.clear;
 				return { signal: watchdog.signal };
@@ -4342,8 +4415,9 @@ async function openCodexSseEventStream(
 				});
 			response = await send(bodyJson);
 		}
-	} finally {
+	} catch (error) {
 		clearPreResponseTimeout?.();
+		throw error;
 	}
 	CODEX_DEBUG &&
 		logger.debug("[codex] codex response", {
@@ -4354,7 +4428,14 @@ async function openCodexSseEventStream(
 			cfRay: response.headers.get("cf-ray") || null,
 		});
 	if (!response.ok) {
-		throw await CodexApiError.fromResponse(response);
+		// The pre-response guard is still armed for a non-2xx response; keep it live
+		// across the error-body read so a stalled body is bounded, then disarm once
+		// the read settles (issue #12664).
+		try {
+			throw await CodexApiError.fromResponse(response);
+		} finally {
+			clearPreResponseTimeout?.();
+		}
 	}
 	updateCodexSessionMetadataFromHeaders(turnState, state, response.headers);
 	if (!response.body) {
